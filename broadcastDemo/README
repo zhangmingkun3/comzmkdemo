@@ -1,0 +1,77 @@
+Broadcast State是Flink支持的一种Operator State。使用Broadcast State，可以在Flink程序的一个Stream中输入数据记录，
+然后将这些数据记录广播（Broadcast）到下游的每个Task中，使得这些数据记录能够为所有的Task所共享，比如一些用于配置的数据记录。
+这样，每个Task在处理其所对应的Stream中记录的时候，读取这些配置，来满足实际数据处理需要。
+
+
+首先会创建一个Keyed或Non-Keyed的Data Stream，然后再创建一个Broadcasted Stream，最后通过Data Stream来连接（调用connect方法）到Broadcasted Stream上，
+这样实现将Broadcast State广播到Data Stream下游的每个Task中。
+    1.如果Data Stream是Keyed Stream，连接到Broadcasted Stream后，添加处理ProcessFunction时需要使用KeyedBroadcastProcessFunction来实现
+        public abstract class KeyedBroadcastProcessFunction<KS, IN1, IN2, OUT> extends BaseBroadcastProcessFunction {
+            public abstract void processElement(final IN1 value, final ReadOnlyContext ctx, final Collector<OUT> out) throws Exception;
+            public abstract void processBroadcastElement(final IN2 value, final Context ctx, final Collector<OUT> out) throws Exception;
+        }
+        KS：表示Flink程序从最上游的Source Operator开始构建Stream，当调用keyBy时所依赖的Key的类型；
+        IN1：表示非Broadcast的Data Stream中的数据记录的类型；
+        IN2：表示Broadcast Stream中的数据记录的类型；
+        OUT：表示经过KeyedBroadcastProcessFunction的processElement()和processBroadcastElement()方法处理后输出结果数据记录的类型。
+    2.Data Stream是Non-Keyed Stream，则连接到Broadcasted Stream后，添加处理ProcessFunction时需要使用BroadcastProcessFunction来实现
+        public abstract class BroadcastProcessFunction<IN1, IN2, OUT> extends BaseBroadcastProcessFunction {
+            public abstract void processElement(final IN1 value, final ReadOnlyContext ctx, final Collector<OUT> out) throws Exception;
+            public abstract void processBroadcastElement(final IN2 value, final Context ctx, final Collector<OUT> out) throws Exception;
+        }
+
+
+案例：
+    针对用户在手机App上操作行为的事件，通过跟踪用户操作来实时触发指定的操作。假设我们关注一个用户在App上经过多次操作之后，比如浏览了几个商品、
+    将浏览过的商品加入购物车、将购物车中的商品移除购物车等等，最后发生了购买行为，那么对于用户从开始到最终达成购买所进行操作的行为的次数，我们
+    定义为用户购物路径长度，通过这个概念假设可以通过推送优惠折扣权限、或者适时地提醒用户使用App等运营活动，能够提高用户的复购率，这个是我们要
+    达成的目标。
+    事件均以指定的格式被实时收集上来，我们统一使用JSON格式表示，例如，一个用户在App上操作行为我们定义有如下几种：
+        VIEW_PRODUCT
+        ADD_TO_CART
+        REMOVE_FROM_CART
+        PURCHASE
+    用户在最终达成下单购买操作过程中，会经过一系列操作：VIEW_PRODUCT、ADD_TO_CART、REMOVE_FROM_CART的不同组合，每个也可以重复操作多次，最终发生
+    购买类型PURCHASE的行为，然后我们对该用户计算其购物路径长度，通过计算该度量来为外部业务系统提供运营或分析活动的基础数据，外部系统可以基于该数
+    据对用户进行各种运营活动。
+
+    用户事件记录如下：
+        {"userId":"d8f3368aba5df27a39cbcfd36ce8084f","channel":"APP","eventType":"VIEW_PRODUCT","eventTime":"2018-06-12_09:27:11","data":{"productId":196}}
+        {"userId":"d8f3368aba5df27a39cbcfd36ce8084f","channel":"APP","eventType":"ADD_TO_CART","eventTime":"2018-06-12_09:43:18","data":{"productId":126}}
+        {"userId":"d8f3368aba5df27a39cbcfd36ce8084f","channel":"APP","eventType":"VIEW_PRODUCT","eventTime":"2018-06-12_09:27:11","data":{"productId":126}}
+        {"userId":"d8f3368aba5df27a39cbcfd36ce8084f","channel":"APP","eventType":"PURCHASE","eventTime":"2018-06-12_09:30:28","data":{"productId":196,"price":600.00,"amount":600.00}}
+
+
+    因为App注册用户很多，不可能所有的用户发生的购物行为路径都能满足特定条件，假设对于购物路径长度很短的，很可能该用户使用App时目的性很强，很快就
+    下单购买，对于这类用户我们暂时先不想对他们做任何运营活动，所以进行流数据处理时需要输入对应的路径长度的配置值，来限制这种情况。而且，随着时间
+    的推移，该值可能会根据实际业务需要而发生变化，我们希望整个Flink计算程序能够动态获取并更新对应的配置值，配置字符串也是JSON格式：
+        {"channel":"APP","registerDate":"2018-01-01","historyPurchaseTimes":0,"maxPurchasePathLength":3}
+
+
+    假设满足大于配置的最大购物路径长度的用户，我们计算出该用户购物的路径长度，同时将其输出到另一个指定的Kafka Topic中，以便其它系统消费该Topic，
+    从而对这些用户进行个性化运营。例如，计算得到的结果格式，除了一个购物路径长度外，还分别统计了达成购买过程中各个操作行为的个数，JSON格式字符串
+    如下所示：
+        {"userId":"a9b83681ba4df17a30abcf085ce80a9b","channel":"APP","purchasePathLength":9,"eventTypeCounts":{"ADD_TO_CART":1,"PURCHASE":1,"VIEW_PRODUCT":7}}
+
+
+处理流程：
+1.用户操作行为事件实时写入到Kafka的Topic中，通过input-event-topic参数指定。
+2.基于input-event-topic参数指定的Topic，创建一个Flink Source Operator，名称为kafkaUserEventSource。
+3.基于kafkaUserEventSource创建一个Data Stream，名称为customerUserEventStream。
+4.渠道配置信息，根据实际业务需要更新，并实时写入到Kafka的Topic中，通过input-config-topic参数指定。
+5.基于input-config-topic参数指定的Topic，创建一个Flink Source Operator，名称为kafkaConfigEventSource。
+6.基于kafkaConfigEventSource创建一个Broadcast Stream，名称为configBroadcastStream。
+7.将上述创建的两个Stream，通过customerUserEventStream连接到configBroadcastStream，得到新的connectedStream。
+8.基于connectedStream设置ProcessFunction实现，来处理新的Stream中的数据记录，可以在每个Task中基于获取到统一的配置信息，进而处理用户事件。
+9.将处理结果发送到Flink Sink Operator，名称为kafkaSink。
+10.kafkaSink将处理的结果，保存到Kafka的Topic中，通过output-topic指定Topic名称。
+
+在Flink Job中开启Checkpoint功能，每隔1小时对Flink Job中的状态进行Checkpointing，以保证流处理过程发生故障后，也能够恢复。
+
+
+
+
+BroadcastConnectedStream调用process()方法，参数类型为KeyedBroadcastProcessFunction或者BroadcastProcessFunction，我们这里实现类为
+ConnectedBroadcastProcessFuntion，它继承自KeyedBroadcastProcessFunction抽象类。通过前面Broadcast State API部分，我们已经了解到，
+需要实现processBroadcastElement()和processElement()这两个处理方法，一个是处理Broadcast Stream，另一个是处理用户操作行为事件Stream。
+首先在ConnectedBroadcastProcessFuntion中定义了一个用来存储用户操作行为事件的状态变量
